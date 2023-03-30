@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from hummingbird.ml import convert
+import onnx2torch
 import onnx
 import numpy as np
 from timeit import timeit
@@ -10,27 +11,41 @@ from onnx_tf.backend import prepare
 import tensorflow as tf
 from sklearn.ensemble import RandomForestClassifier
 from pathlib import Path
-
-
-def get_random_forest_model_onnx():
-    pass
-
+import logging
+import tarfile
+import os
+from torch.utils.mobile_optimizer import optimize_for_mobile
+import zipfile
 
 _BENCHMARK_FORMAT_STRING = "#### Model: {}\tEngine: {}:\tTime (s): {}"
-_OUTPUT_DIR = Path("/tmp/")
+_OUTPUT_DIR = Path("models/")
 
 
 class SimpleLSTM(nn.Module):
     def __init__(self, input_feature_size=10, lstm_size=256, output_size=3) -> None:
         super().__init__()
+        torch.random.manual_seed(1)
+
         self.lstm = nn.LSTM(
             input_size=input_feature_size, hidden_size=lstm_size, batch_first=True
         )
         self.dense = nn.Linear(lstm_size, output_size)
+        nn.init.xavier_uniform(self.dense.weight)
 
     def forward(self, X):
         lstm_out, _ = self.lstm(X)
         return self.dense(lstm_out)
+
+
+class SimpleTransformer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        torch.random.manual_seed(1)
+
+        self.transformer = nn.Transformer()
+
+    def forward(self, X):
+        return self.transformer(X, X)
 
 
 def export_lstm_model(hacky_benchmark=False):
@@ -42,71 +57,67 @@ def export_lstm_model(hacky_benchmark=False):
     export_dnn_torch(model, model_name, input_shape, hacky_benchmark)
     export_dnn_onnx(model, model_name, input_shape, hacky_benchmark)
     export_dnn_tvm(model, model_name, input_shape, hacky_benchmark)
-    export_dnn_tflite(model, model_name, input_shape, hacky_benchmark)
+    # export_dnn_tflite(model, model_name, input_shape, hacky_benchmark)
 
 
 def export_transformer_model(hacky_benchmark=False):
-    model = torch.hub.load(
-        "huggingface/pytorch-transformers", "model", "bert-base-uncased"
-    )
-    input_shape = (100, 10)
-    model_name = "bert"
+    model = SimpleTransformer()
+    input_shape = (100, 10, 512)
+    model_name = "transformer"
+
     export_dnn_torch(model, model_name, input_shape, hacky_benchmark)
     export_dnn_onnx(model, model_name, input_shape, hacky_benchmark)
-    # export_dnn_tflite(model, model_name, input_shape, hacky_benchmark) # crashes
+    # export_dnn_tflite(
+    #     model, model_name, input_shape, hacky_benchmark
+    # )  # crashes exit code 137, out of memory
     export_dnn_tvm(model, model_name, input_shape, hacky_benchmark)
+
+
+def _save_tree_model(model, output_file):
+    target_file = _OUTPUT_DIR / output_file
+    if (target_file).exists():
+        os.remove(target_file)
+
+    model.save(str(target_file))
+
+    with zipfile.ZipFile(str(target_file) + ".zip") as model_archive:
+        deploy_model_name = "deploy_model" + target_file.suffix
+        model_archive.extract(deploy_model_name, _OUTPUT_DIR)
+        os.rename(_OUTPUT_DIR / deploy_model_name, _OUTPUT_DIR / output_file)
 
 
 def export_tree_model(hacky_benchmark=False):
     # Create some random data for binary classification
     num_classes = 2
-    X = np.random.rand(100000, 28)
+    num_features = 28
+    X = np.random.rand(100000, num_features).astype(np.float32)
     y = np.random.randint(num_classes, size=100000)
 
     # Create and train a model (scikit-learn RandomForestClassifier in this case)
     skl_model = RandomForestClassifier(n_estimators=10, max_depth=10)
     skl_model.fit(X, y)
 
-    model_torch = convert(skl_model, "pytorch")
-    model_torch.save(str(_OUTPUT_DIR / "tree.pb"))
+    model_torch = convert(skl_model, "torchscript", test_input=X)
+    _save_tree_model(model_torch, "tree.pb")
 
-    model_onnx = convert(skl_model, "onnx", test_input=X)
-    model_onnx.save(str(_OUTPUT_DIR / "tree.onnx"))
+    model_input_shape = (100, num_features)
 
-    model_tvm = convert(skl_model, "tvm", test_input=X)
-    model_tvm.save(str(_OUTPUT_DIR / "tree.so"))
-
-    if hacky_benchmark:
-
-        def _benchmark_torch():
-            model_torch.predict(X)
-
-        def _benchmark_onnx():
-            model_onnx.predict(X)
-
-        def _benchmark_tvm():
-            model_tvm.predict(X)
-
-        for engine, benchmark_fn in {
-            "torch": "_benchmark_torch",
-            "onnx": "_benchmark_onnx",
-            "tvm": "_benchmark_tvm",
-        }.items():
-            benchmark_s = timeit(benchmark_fn, globals=locals())
-            print(_BENCHMARK_FORMAT_STRING.format("Tree", engine, benchmark_s))
-
-    # export_dnn_tflite(None, "tree", input_shape=(1, 28), hacky_benchmark=hacky_benchmark)
+    export_dnn_onnx(model_torch.model, "tree", model_input_shape, hacky_benchmark)
+    # TVM infinite loops trying to compile the tree model :/
 
 
 def export_dnn_torch(model_torch, model_name, input_shape, hacky_benchmark):
-    torch.save(model_torch, _OUTPUT_DIR / f"{model_name}.pt")
+    model_torch_script = torch.jit.script(model_torch)
+
+    optimized_model = optimize_for_mobile(model_torch_script)
+    optimized_model.save(_OUTPUT_DIR / f"{model_name}.pb")
     if hacky_benchmark:
         with torch.no_grad():
             np.random.seed(1)
             sample_inputs = np.random.rand(*input_shape)
 
             def _benchmark():
-                model_torch(sample_inputs)
+                optimized_model(sample_inputs)
 
             benchmark_s = timeit("_benchmark", globals=locals())
             print(_BENCHMARK_FORMAT_STRING.format(model_name, "Torch", benchmark_s))
@@ -123,7 +134,7 @@ def export_dnn_onnx(model_torch, model_name, input_shape, hacky_benchmark):
         filename,
         export_params=True,
         input_names=["input"],
-        opset_version=12,
+        output_names=["output"],
     )
 
     if hacky_benchmark:
@@ -140,14 +151,26 @@ def export_dnn_onnx(model_torch, model_name, input_shape, hacky_benchmark):
 
 
 def export_dnn_tvm(model_torch, model_name, input_shape, hacky_benchmark):
-    model = tvmc.load(str(_OUTPUT_DIR / f"{model_name}.onnx"))
-    # records = tvmc.tune(model, target="llvm", enable_autoscheduler=False, early_stopping=3)
+    model = tvmc.load(
+        str(_OUTPUT_DIR / f"{model_name}.onnx"), shape_dict={"input": input_shape}
+    )
+    records = None
+    records = tvmc.tune(
+        model,
+        target="llvm",
+        enable_autoscheduler=True,
+    )
     package = tvmc.compile(
         model,
         target="llvm",
-        package_path=f"/tmp/{model_name}.so",
-        tuning_records=None,
+        package_path=str(_OUTPUT_DIR / f"{model_name}.tar"),
+        tuning_records=records,
     )
+
+    with tarfile.open(str(_OUTPUT_DIR / f"{model_name}.tar")) as model_archive:
+        model_archive.extract("mod.so", _OUTPUT_DIR)
+        os.rename(_OUTPUT_DIR / "mod.so", _OUTPUT_DIR / f"{model_name}.so")
+
     if hacky_benchmark:
         np.random.seed(1)
         sample_inputs = {"input": np.random.rand(*input_shape)}
